@@ -4,6 +4,7 @@ import com.alibaba.excel.EasyExcelFactory;
 import com.alibaba.excel.ExcelWriter;
 import com.alibaba.excel.context.AnalysisContext;
 import com.alibaba.excel.event.AnalysisEventListener;
+import com.alibaba.excel.metadata.CellData;
 import com.alibaba.excel.write.metadata.WriteSheet;
 import com.zxc.publics.annotation.ImportExcelField;
 import com.zxc.publics.exception.ExcelHeadException;
@@ -14,6 +15,7 @@ import com.zxc.publics.handler.CustomCellColorWriteHandler;
 import com.zxc.publics.handler.CustomCellWriteHandler;
 import com.zxc.publics.util.StringUtil;
 import io.micrometer.core.instrument.util.NamedThreadFactory;
+import io.micrometer.core.instrument.util.StringUtils;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -104,13 +106,19 @@ public class ExcelImportDataListener<T> extends AnalysisEventListener<Map<Intege
     // 导入是否完成标识
     private Boolean importFinishFlag = false;
 
+    // 读取到的表头数量
+    private int headCount = 0;
+
+    // 文件数据总条数
+    private int maxAllowDataNum;
+
     // 导入开始时间
     private long startTime;
 
     // 导入结束时间
     private long endTime;
 
-    public ExcelImportDataListener(int excelHeadRowIndex, Class<?> clazz, int batchSize, ThrowingRunnable<Exception> beforeImportMethod, ThrowingRunnable<Exception> afterImportMethod, ThrowingConsumer<T, Exception> importMethod, ThrowingFunction<T, Boolean, Exception> checkDataMethod, String illegalDataExportFileName, long startTime) {
+    public ExcelImportDataListener(int excelHeadRowIndex, Class<?> clazz, int batchSize, ThrowingRunnable<Exception> beforeImportMethod, ThrowingRunnable<Exception> afterImportMethod, ThrowingConsumer<T, Exception> importMethod, ThrowingFunction<T, Boolean, Exception> checkDataMethod, String illegalDataExportFileName, long startTime, int maxAllowDataNum) {
         this.excelHeadRowIndex = excelHeadRowIndex;
         this.clazz = clazz;
         this.batchSize = batchSize;
@@ -121,9 +129,10 @@ public class ExcelImportDataListener<T> extends AnalysisEventListener<Map<Intege
         this.illegalDataExportFileName = illegalDataExportFileName.endsWith(".xlsx") ? illegalDataExportFileName : illegalDataExportFileName + ".xlsx";
         this.startTime = startTime;
         this.executorService = new ThreadPoolExecutor(Runtime.getRuntime().availableProcessors() + 1, (Runtime.getRuntime().availableProcessors() + 1) * 2, 3L, TimeUnit.MINUTES, new LinkedBlockingQueue<>(500), new NamedThreadFactory("excelImportListener"), new ThreadPoolExecutor.CallerRunsPolicy());
+        this.maxAllowDataNum = maxAllowDataNum;
     }
 
-    public ExcelImportDataListener(int excelHeadRowIndex, Class<?> clazz, int batchSize, ThrowingRunnable<Exception> beforeImportMethod, ThrowingRunnable<Exception> afterImportMethod, ThrowingConsumer<T, Exception> importMethod, ThrowingFunction<T, Boolean, Exception> checkDataMethod, String illegalDataExportFileName, long startTime, ExecutorService executorService) {
+    public ExcelImportDataListener(int excelHeadRowIndex, Class<?> clazz, int batchSize, ThrowingRunnable<Exception> beforeImportMethod, ThrowingRunnable<Exception> afterImportMethod, ThrowingConsumer<T, Exception> importMethod, ThrowingFunction<T, Boolean, Exception> checkDataMethod, String illegalDataExportFileName, long startTime, ExecutorService executorService, int maxAllowDataNum) {
         this.excelHeadRowIndex = excelHeadRowIndex;
         this.clazz = clazz;
         this.batchSize = batchSize;
@@ -134,6 +143,24 @@ public class ExcelImportDataListener<T> extends AnalysisEventListener<Map<Intege
         this.illegalDataExportFileName = illegalDataExportFileName.endsWith(".xlsx") ? illegalDataExportFileName : illegalDataExportFileName + ".xlsx";
         this.startTime = startTime;
         this.executorService = executorService;
+        this.maxAllowDataNum = maxAllowDataNum;
+    }
+
+    /**
+     * 校验Excel文件表头字段名是否合法
+     *
+     * @param headMap
+     * @param context
+     */
+    @Override
+    public void invokeHead(Map<Integer, CellData> headMap, AnalysisContext context) {
+        log.info("ExcelImportDataListener invokeHead >>> headCount = {}, headMap = {}", headCount, headMap);
+        if (headCount == excelHeadRowIndex - 1 &&
+                !Objects.equals(getAllExcelFieldNames(), headMap.values().stream().map(CellData::getStringValue).collect(Collectors.toList())))
+            exception = new ExcelHeadException("导入的Excel文件表头字段不合法！");
+        else headCount++;
+        if ((context.getTotalCount() == null ? 0 : context.getTotalCount()) > maxAllowDataNum)
+            throw new RuntimeException("导入的数据条数超过最大阈值 " + maxAllowDataNum + " ！");
     }
 
     /**
@@ -193,14 +220,20 @@ public class ExcelImportDataListener<T> extends AnalysisEventListener<Map<Intege
 
         if (dataList.isEmpty()) return;
         for (int i = 0; i < dataList.size(); i++) {
-            if (exception != null) break;
+            if (exception != null) throw new RuntimeException(exception);
+            if (firstHandleDataFlag && i == 0) {
+                try {
+                    beforeImportMethod.run();
+                } catch (Exception e) {
+                    log.error("beforeImportMethod error", e);
+                }
+            }
             int finalI = i;
             successCompletableFutureList.add(CompletableFuture.runAsync(() -> {
                 try {
-                    importThisData(finalI, dataList.get(finalI));
+                    importThisData(dataList.get(finalI));
                 } catch (Exception e) {
                     log.error("handleDataList error", e);
-                    if (e instanceof ExcelHeadException) exception = (ExcelHeadException) e;
                 }
             }, executorService));
         }
@@ -218,22 +251,11 @@ public class ExcelImportDataListener<T> extends AnalysisEventListener<Map<Intege
     /**
      * 核心方法：单条数据处理逻辑
      *
-     * @param finalI
      * @param integerStringMap
      * @throws Exception
      */
-    private void importThisData(int finalI, Map<Integer, String> integerStringMap) throws Exception {
+    private void importThisData(Map<Integer, String> integerStringMap) throws Exception {
 
-        if (firstHandleDataFlag) {
-            if (finalI < excelHeadRowIndex - 2) return;
-            if (finalI == excelHeadRowIndex - 2) {
-                checkExcelFieldNames(integerStringMap);
-                return;
-            }
-            if (finalI == excelHeadRowIndex - 1) {
-                beforeImportMethod.run();
-            }
-        }
         T t = getData(integerStringMap);
         log.info("data: {}", t);
         try {
@@ -268,7 +290,7 @@ public class ExcelImportDataListener<T> extends AnalysisEventListener<Map<Intege
                 .forEach(order -> {
                     if (flag.get()) return;
                     String value = integerStringMap.get(order);
-                    if (StringUtil.isEmpty(value)) return;
+                    if (StringUtils.isBlank(value)) return;
                     if (dataList.stream().anyMatch(map -> value.equals(map.get(order)))) {
                         try {
                             errorListAdd(reloadThisMap(integerStringMap));
@@ -307,6 +329,7 @@ public class ExcelImportDataListener<T> extends AnalysisEventListener<Map<Intege
      * @return
      * @throws Exception
      */
+    @SuppressWarnings("unchecked")
     private T getData(Map<Integer, String> data) throws Exception {
 
         Object o = clazz.getConstructor().newInstance();
@@ -382,7 +405,7 @@ public class ExcelImportDataListener<T> extends AnalysisEventListener<Map<Intege
      */
     private List<List<String>> getExcelHead() {
 
-        return Collections.singletonList(getAllExcelFieldNames().stream().map(ImportExcelField::name).collect(Collectors.toList()));
+        return Collections.singletonList(getAllExcelFieldNames());
 
     }
 
@@ -421,23 +444,6 @@ public class ExcelImportDataListener<T> extends AnalysisEventListener<Map<Intege
     }
 
     /**
-     * 校验导入的excel文件字段名称行是否合法
-     *
-     * @param map
-     * @return
-     */
-    private void checkExcelFieldNames(Map<Integer, String> map) throws Exception {
-
-        List<String> allExcelFieldNames = getAllExcelFieldNames().stream().map(ImportExcelField::name).collect(Collectors.toList());
-        for (int i = 0; i < allExcelFieldNames.size(); i++) {
-            if (!StringUtil.valueToStr(map.get(i)).equals(allExcelFieldNames.get(i))) {
-                throw new ExcelHeadException("导入的Excel文件表头字段不合法！");
-            }
-        }
-
-    }
-
-    /**
      * 获得实体类中所有加了@Excelfield注解的属性集合
      *
      * @return
@@ -452,16 +458,17 @@ public class ExcelImportDataListener<T> extends AnalysisEventListener<Map<Intege
     }
 
     /**
-     * 获得实体类中所有的@Excelfield注解集合
+     * 获得实体类中所有加了@Excelfield注解的字段名集合
      *
      * @return
      */
-    private List<ImportExcelField> getAllExcelFieldNames() {
+    private List<String> getAllExcelFieldNames() {
 
         return Arrays.stream(clazz.getDeclaredFields())
                 .filter(field -> field.isAnnotationPresent(ImportExcelField.class))
                 .map(field -> field.getAnnotation(ImportExcelField.class))
                 .sorted(Comparator.comparingInt(ImportExcelField::order))
+                .map(ImportExcelField::name)
                 .collect(Collectors.toList());
 
     }

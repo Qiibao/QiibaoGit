@@ -4,7 +4,6 @@ import com.alibaba.excel.EasyExcel;
 import com.zxc.publics.entity.ImportResult;
 import com.zxc.publics.entity.Result;
 import com.zxc.publics.enums.CodeEnum;
-import com.zxc.publics.listener.ExcelHeadCheckListener;
 import com.zxc.publics.listener.ExcelImportDataListener;
 import com.zxc.publics.module.moduleInterface.ImportModuleInterface;
 import com.zxc.publics.util.StringUtil;
@@ -58,15 +57,6 @@ public abstract class ImportExcelModule<T> implements ImportModuleInterface<T> {
         this.illegalDataExportFileName = EXCEL_ILLEGAL_DATA_EXPORT_NAME;
     }
 
-    public ImportExcelModule(MultipartFile file, Class<?> clazz, int excelMaxAllowDataNum, int excelEveryAddDataNum) {
-        this.file = file;
-        this.clazz = clazz;
-        this.excelHeadRowIndex = EXCEL_HEAD_ROW_INDEX;
-        this.maxAllowDataNum = excelMaxAllowDataNum;
-        this.everyAddDataNum = excelEveryAddDataNum;
-        this.illegalDataExportFileName = EXCEL_ILLEGAL_DATA_EXPORT_NAME;
-    }
-
     public ImportExcelModule(MultipartFile file, Class<?> clazz, String illegalDataExportFileName) {
         this.file = file;
         this.clazz = clazz;
@@ -81,6 +71,15 @@ public abstract class ImportExcelModule<T> implements ImportModuleInterface<T> {
         this.clazz = clazz;
         this.excelHeadRowIndex = excelHeadRowIndex;
         this.maxAllowDataNum = EXCEL_MAX_ALLOW_DATA_NUM;
+        this.everyAddDataNum = EXCEL_EVERY_ADD_DATA_NUM;
+        this.illegalDataExportFileName = EXCEL_ILLEGAL_DATA_EXPORT_NAME;
+    }
+
+    public ImportExcelModule(MultipartFile file, Class<?> clazz, int excelHeadRowIndex, int excelMaxAllowDataNum) {
+        this.file = file;
+        this.clazz = clazz;
+        this.excelHeadRowIndex = excelHeadRowIndex;
+        this.maxAllowDataNum = excelMaxAllowDataNum;
         this.everyAddDataNum = EXCEL_EVERY_ADD_DATA_NUM;
         this.illegalDataExportFileName = EXCEL_ILLEGAL_DATA_EXPORT_NAME;
     }
@@ -152,11 +151,7 @@ public abstract class ImportExcelModule<T> implements ImportModuleInterface<T> {
         startTime = System.currentTimeMillis();
         // 1.校验文件是否为合法的Excel文件
         checkExcelFile();
-        // 2.校验Excel文件字段名是否合法
-        checkExcelHead();
-        // 3.校验数据条数是否合法
-        checkExcelDataNum();
-        // 4.数据处理
+        // 2.数据处理
         handleExcelData();
 
     }
@@ -184,29 +179,8 @@ public abstract class ImportExcelModule<T> implements ImportModuleInterface<T> {
     private void handleExcelData() throws Exception {
 
         log.info("handleExcelData start >>> class: {}", clazz);
-        importDataListener = new ExcelImportDataListener<>(excelHeadRowIndex, clazz, everyAddDataNum, this::beforeImport, this::afterImport, this::importExcelData, this::checkExcelData, illegalDataExportFileName, startTime);
-        EasyExcel.read(file.getInputStream(), importDataListener).headRowNumber(1).sheet(0).doReadSync();
-
-    }
-
-    /**
-     * 校验Excel文件字段名是否合法
-     *
-     * @throws Exception
-     */
-    private void checkExcelHead() throws Exception {
-
-        // 创建监听器
-        ExcelHeadCheckListener excelHeadCheckListener = new ExcelHeadCheckListener(clazz);
-        // 文件表头读取
-        EasyExcel.read(file.getInputStream(), excelHeadCheckListener).headRowNumber(1).sheet(0).doReadSync();
-        // 设置文件条数(不包括表头)
-        excelDataNum = excelHeadCheckListener.getFileSzie() - excelHeadRowIndex;
-        log.info("导入的数据总行数为 {}", excelDataNum);
-        // 从监听器中获取校验结果
-        if (excelHeadRowIndex == 1 && !excelHeadCheckListener.isSuccess()) {
-            throw new Exception("导入的Excel文件表头字段不合法！");
-        }
+        importDataListener = new ExcelImportDataListener<>(excelHeadRowIndex, clazz, everyAddDataNum, this::beforeImport, this::afterImport, this::importExcelData, this::checkExcelData, illegalDataExportFileName, startTime, maxAllowDataNum);
+        EasyExcel.read(file.getInputStream(), importDataListener).headRowNumber(excelHeadRowIndex).sheet(0).doReadSync();
 
     }
 
@@ -219,19 +193,6 @@ public abstract class ImportExcelModule<T> implements ImportModuleInterface<T> {
 
         if (file == null || file.getOriginalFilename() == null || !file.getOriginalFilename().endsWith(".xlsx")) {
             throw new Exception("excel文件不合法！");
-        }
-
-    }
-
-    /**
-     * 校验数据条数是否合法
-     *
-     * @throws Exception
-     */
-    private void checkExcelDataNum() throws Exception {
-
-        if (excelDataNum < 0 || excelDataNum > maxAllowDataNum) {
-            throw new Exception("导入的数据条数不合法！");
         }
 
     }
